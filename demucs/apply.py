@@ -171,169 +171,181 @@ def apply_model(model: tp.Union[BagOfModels, Model],
             use in parallel.
         segment (float or None): override the model segment parameter.
     """
-    if device is None:
-        device = mix.device
-    else:
-        device = th.device(device)
-    if pool is None:
-        if num_workers > 0 and device.type == 'cpu':
-            pool = ThreadPoolExecutor(num_workers)
+    try:
+        if device is None:
+            device = mix.device
         else:
-            pool = DummyPoolExecutor()
-    if lock is None:
-        lock = Lock()
-    callback_arg = _replace_dict(
-        callback_arg, *{"model_idx_in_bag": 0, "shift_idx": 0, "segment_offset": 0}.items()
-    )
-    kwargs: tp.Dict[str, tp.Any] = {
-        'shifts': shifts,
-        'split': split,
-        'overlap': overlap,
-        'transition_power': transition_power,
-        'progress': progress,
-        'device': device,
-        'pool': pool,
-        'segment': segment,
-        'lock': lock,
-    }
-    out: tp.Union[float, th.Tensor]
-    res: tp.Union[float, th.Tensor, None]
-    if isinstance(model, BagOfModels):
-        # Special treatment for bag of model.
-        # We explicitely apply multiple times `apply_model` so that the random shifts
-        # are different for each model.
-        estimates: tp.Union[float, th.Tensor] = 0.
-        totals = [0.] * len(model.sources)
-        callback_arg["models"] = len(model.models)
-        kwargs["callback"] = (
-            (
-                lambda d, i=callback_arg["model_idx_in_bag"]: callback(
-                    _replace_dict(d, ("model_idx_in_bag", i))
-                )
-            )
-            if callable(callback)
-            else None
+            device = th.device(device)
+        if pool is None:
+            if num_workers > 0 and device.type == 'cpu':
+                pool = ThreadPoolExecutor(num_workers)
+            else:
+                pool = DummyPoolExecutor()
+        if lock is None:
+            lock = Lock()
+        callback_arg = _replace_dict(
+            callback_arg, *{"model_idx_in_bag": 0, "shift_idx": 0, "segment_offset": 0}.items()
         )
-        for sub_model, model_weights in zip(model.models, model.weights):
-            original_model_device = next(iter(sub_model.parameters())).device
-            sub_model.to(device)
-
-            res = apply_model(sub_model, mix, **kwargs, callback_arg=callback_arg)
-            if res is None:
-                return res
-            out = res
-            sub_model.to(original_model_device)
-            for k, inst_weight in enumerate(model_weights):
-                out[:, k, :, :] *= inst_weight
-                totals[k] += inst_weight
-            estimates += out
-            del out
-            callback_arg["model_idx_in_bag"] += 1
-
-        assert isinstance(estimates, th.Tensor)
-        for k in range(estimates.shape[1]):
-            estimates[:, k, :, :] /= totals[k]
-        return estimates
-
-    if "models" not in callback_arg:
-        callback_arg["models"] = 1
-    model.to(device)
-    model.eval()
-    assert transition_power >= 1, "transition_power < 1 leads to weird behavior."
-    batch, channels, length = mix.shape
-    if shifts:
-        kwargs['shifts'] = 0
-        max_shift = int(0.5 * model.samplerate)
-        mix = tensor_chunk(mix)
-        assert isinstance(mix, TensorChunk)
-        padded_mix = mix.padded(length + 2 * max_shift)
-        out = 0.
-        for shift_idx in range(shifts):
-            offset = random.randint(0, max_shift)
-            shifted = TensorChunk(padded_mix, offset, length + max_shift - offset)
+        kwargs: tp.Dict[str, tp.Any] = {
+            'shifts': shifts,
+            'split': split,
+            'overlap': overlap,
+            'transition_power': transition_power,
+            'progress': progress,
+            'device': device,
+            'pool': pool,
+            'segment': segment,
+            'lock': lock,
+        }
+        out: tp.Union[float, th.Tensor]
+        res: tp.Union[float, th.Tensor, None]
+        if isinstance(model, BagOfModels):
+            # Special treatment for bag of model.
+            # We explicitely apply multiple times `apply_model` so that the random shifts
+            # are different for each model.
+            estimates: tp.Union[float, th.Tensor] = 0.
+            totals = [0.] * len(model.sources)
+            callback_arg["models"] = len(model.models)
             kwargs["callback"] = (
-                    (lambda d, i=shift_idx: callback(_replace_dict(d, ("shift_idx", i))))
-                    if callable(callback)
-                    else None
+                (
+                    lambda d, i=callback_arg["model_idx_in_bag"]: callback(
+                        _replace_dict(d, ("model_idx_in_bag", i))
+                    )
                 )
-            res = apply_model(model, shifted, **kwargs, callback_arg=callback_arg)
-            if res is None:
-                return res
-            shifted_out = res
-            out += shifted_out[..., max_shift - offset:]
-        out /= shifts
-        assert isinstance(out, th.Tensor)
-        return out
-    elif split:
-        kwargs['split'] = False
-        out = th.zeros(batch, len(model.sources), channels, length, device=mix.device)
-        sum_weight = th.zeros(length, device=mix.device)
-        if segment is None:
-            segment = model.segment
-        assert segment is not None and segment > 0.
-        segment_length: int = int(model.samplerate * segment)
-        stride = int((1 - overlap) * segment_length)
-        offsets = range(0, length, stride)
-        scale = float(format(stride / model.samplerate, ".2f"))
-        # We start from a triangle shaped weight, with maximal weight in the middle
-        # of the segment. Then we normalize and take to the power `transition_power`.
-        # Large values of transition power will lead to sharper transitions.
-        weight = th.cat([th.arange(1, segment_length // 2 + 1, device=device),
-                         th.arange(segment_length - segment_length // 2, 0, -1, device=device)])
-        assert len(weight) == segment_length
-        # If the overlap < 50%, this will translate to linear transition when
-        # transition_power is 1.
-        weight = (weight / weight.max())**transition_power
-        futures = []
-        for offset in offsets:
-            chunk = TensorChunk(mix, offset, segment_length)
-            future = pool.submit(apply_model, model, chunk, **kwargs, callback_arg=callback_arg,
-                                 callback=(lambda d, i=offset:
-                                           callback(_replace_dict(d, ("segment_offset", i))))
-                                 if callable(callback) else None)
-            futures.append((future, offset))
-            offset += segment_length
-        if progress:
-            futures = tqdm.tqdm(futures, unit_scale=scale, ncols=120, unit='seconds')
-        for future, offset in futures:
-            chunk_out = future.result()  # type: tp.Union[None, th.Tensor]
-            if chunk_out is None:
-                pool.shutdown(wait=False, cancel_futures=True)
-                return chunk_out
-            chunk_length = chunk_out.shape[-1]
-            out[..., offset:offset + segment_length] += (
-                weight[:chunk_length] * chunk_out).to(mix.device)
-            sum_weight[offset:offset + segment_length] += weight[:chunk_length].to(mix.device)
-        assert sum_weight.min() > 0
-        out /= sum_weight
-        assert isinstance(out, th.Tensor)
-        return out
-    else:
-        valid_length: int
-        if isinstance(model, HTDemucs) and segment is not None:
-            valid_length = int(segment * model.samplerate)
-        elif hasattr(model, 'valid_length'):
-            valid_length = model.valid_length(length)  # type: ignore
+                if callable(callback)
+                else None
+            )
+            for sub_model, model_weights in zip(model.models, model.weights):
+                original_model_device = next(iter(sub_model.parameters())).device
+                sub_model.to(device)
+
+                res = apply_model(sub_model, mix, **kwargs, callback_arg=callback_arg)
+                if res is None:
+                    return res
+                out = res
+                sub_model.to(original_model_device)
+                for k, inst_weight in enumerate(model_weights):
+                    out[:, k, :, :] *= inst_weight
+                    totals[k] += inst_weight
+                estimates += out
+                del out
+                callback_arg["model_idx_in_bag"] += 1
+
+            assert isinstance(estimates, th.Tensor)
+            for k in range(estimates.shape[1]):
+                estimates[:, k, :, :] /= totals[k]
+            return estimates
+
+        if "models" not in callback_arg:
+            callback_arg["models"] = 1
+        model.to(device)
+        model.eval()
+        assert transition_power >= 1, "transition_power < 1 leads to weird behavior."
+        batch, channels, length = mix.shape
+        if shifts:
+            kwargs['shifts'] = 0
+            max_shift = int(0.5 * model.samplerate)
+            mix = tensor_chunk(mix)
+            assert isinstance(mix, TensorChunk)
+            padded_mix = mix.padded(length + 2 * max_shift)
+            out = 0.
+            for shift_idx in range(shifts):
+                offset = random.randint(0, max_shift)
+                shifted = TensorChunk(padded_mix, offset, length + max_shift - offset)
+                kwargs["callback"] = (
+                        (lambda d, i=shift_idx: callback(_replace_dict(d, ("shift_idx", i))))
+                        if callable(callback)
+                        else None
+                    )
+                res = apply_model(model, shifted, **kwargs, callback_arg=callback_arg)
+                if res is None:
+                    return res
+                shifted_out = res
+                out += shifted_out[..., max_shift - offset:]
+            out /= shifts
+            assert isinstance(out, th.Tensor)
+            return out
+        elif split:
+            kwargs['split'] = False
+            out = th.zeros(batch, len(model.sources), channels, length, device=mix.device)
+            sum_weight = th.zeros(length, device=mix.device)
+            if segment is None:
+                segment = model.segment
+            assert segment is not None and segment > 0.
+            segment_length: int = int(model.samplerate * segment)
+            stride = int((1 - overlap) * segment_length)
+            offsets = range(0, length, stride)
+            scale = float(format(stride / model.samplerate, ".2f"))
+            # We start from a triangle shaped weight, with maximal weight in the middle
+            # of the segment. Then we normalize and take to the power `transition_power`.
+            # Large values of transition power will lead to sharper transitions.
+            weight = th.cat([th.arange(1, segment_length // 2 + 1, device=device),
+                            th.arange(segment_length - segment_length // 2, 0, -1, device=device)])
+            assert len(weight) == segment_length
+            # If the overlap < 50%, this will translate to linear transition when
+            # transition_power is 1.
+            weight = (weight / weight.max())**transition_power
+            futures = []
+            for offset in offsets:
+                chunk = TensorChunk(mix, offset, segment_length)
+                future = pool.submit(apply_model, model, chunk, **kwargs, callback_arg=callback_arg,
+                                    callback=(lambda d, i=offset:
+                                            callback(_replace_dict(d, ("segment_offset", i))))
+                                    if callable(callback) else None)
+                futures.append((future, offset))
+                offset += segment_length
+            if progress:
+                futures = tqdm.tqdm(futures, unit_scale=scale, ncols=120, unit='seconds')
+            for future, offset in futures:
+                chunk_out = future.result()  # type: tp.Union[None, th.Tensor]
+                if chunk_out is None:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    return chunk_out
+                chunk_length = chunk_out.shape[-1]
+                out[..., offset:offset + segment_length] += (
+                    weight[:chunk_length] * chunk_out).to(mix.device)
+                sum_weight[offset:offset + segment_length] += weight[:chunk_length].to(mix.device)
+            assert sum_weight.min() > 0
+            out /= sum_weight
+            assert isinstance(out, th.Tensor)
+            return out
         else:
-            valid_length = length
-        mix = tensor_chunk(mix)
-        assert isinstance(mix, TensorChunk)
-        padded_mix = mix.padded(valid_length).to(device)
-        with lock:
-            try:
-                callback(_replace_dict(callback_arg, ("state", "start")))  # type: ignore
-            except KeyboardInterrupt:
-                raise
-            except Exception:
-                pass
-        with th.no_grad():
-            out = model(padded_mix)
-        with lock:
-            try:
-                callback(_replace_dict(callback_arg, ("state", "end")))  # type: ignore
-            except KeyboardInterrupt:
-                raise
-            except Exception:
-                pass
-        assert isinstance(out, th.Tensor)
-        return center_trim(out, length)
+            valid_length: int
+            if isinstance(model, HTDemucs) and segment is not None:
+                valid_length = int(segment * model.samplerate)
+            elif hasattr(model, 'valid_length'):
+                valid_length = model.valid_length(length)  # type: ignore
+            else:
+                valid_length = length
+            mix = tensor_chunk(mix)
+            assert isinstance(mix, TensorChunk)
+            padded_mix = mix.padded(valid_length).to(device)
+            with lock:
+                try:
+                    callback(_replace_dict(callback_arg, ("state", "start")))  # type: ignore
+                except KeyboardInterrupt:
+                    raise
+                except Exception:
+                    pass
+            with th.no_grad():
+                out = model(padded_mix)
+            with lock:
+                try:
+                    callback(_replace_dict(callback_arg, ("state", "end")))  # type: ignore
+                except KeyboardInterrupt:
+                    raise
+                except Exception:
+                    pass
+            assert isinstance(out, th.Tensor)
+            return center_trim(out, length)
+    except Exception as e:
+        # Catch any exception and print a detailed error message
+        print("[ERROR] Exception caught in apply_model!")
+        print("Exception type:", type(e))
+        print("Exception message:", str(e))
+        if hasattr(e, 'args'):
+            print("Exception args:", e.args)
+        import traceback
+        print(traceback.format_exc())
+        return None
+    

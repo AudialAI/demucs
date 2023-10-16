@@ -28,6 +28,7 @@ import torchaudio as ta
 from dora.log import fatal
 from pathlib import Path
 from typing import Optional, Callable, Dict, Tuple, Union
+import traceback
 
 from .apply import apply_model, _replace_dict
 from .audio import AudioFile, convert_audio, save_audio
@@ -262,12 +263,31 @@ class Separator:
         -----
         Use this function with cautiousness. This function does not provide data verifying.
         """
-        if sr is not None and sr != self.samplerate:
-            wav = convert_audio(wav, sr, self._samplerate, self._audio_channels)
-        ref = wav.mean(0)
-        wav -= ref.mean()
-        wav /= ref.std()
-        out = apply_model(
+        print("[DEBUG] Starting separate_tensor function...")
+        
+        try:
+            # Print shapes and types
+            print(f"[DEBUG] wav shape: {wav.shape}, wav type: {wav.dtype}")
+
+            # Print model information
+            print(f"[DEBUG] Model details: {self._model}")
+
+            if sr is not None and sr != self.samplerate:
+                print("[DEBUG] Converting audio...")
+                wav = convert_audio(wav, sr, self._samplerate, self._audio_channels)
+
+            ref = wav.mean(0)
+            # Print intermediate values
+            print(f"[DEBUG] ref mean: {ref.mean()}, ref std: {ref.std()}")
+
+            wav -= ref.mean()
+            wav /= ref.std()
+
+            # Print configuration settings
+            print(f"[DEBUG] Config - samplerate: {self.samplerate}, shifts: {self._shifts}, overlap: {self._overlap}")
+            
+            print("[DEBUG] Applying model for separation...")
+            out = apply_model(
                 self._model,
                 wav[None],
                 segment=self._segment,
@@ -282,13 +302,23 @@ class Separator:
                 ),
                 progress=self._progress,
             )
-        if out is None:
-            raise KeyboardInterrupt
-        out *= ref.std()
-        out += ref.mean()
-        wav *= ref.std()
-        wav += ref.mean()
-        return (wav, dict(zip(self._model.sources, out[0])))
+
+            if out is None:
+                raise Exception("Output from model is None.")
+
+            out *= ref.std()
+            out += ref.mean()
+            wav *= ref.std()
+            wav += ref.mean()
+
+            print("[DEBUG] Tensor separation completed successfully")
+            print("[DEBUG] Exiting separate_tensor function...")
+            return (wav, dict(zip(self._model.sources, out[0])))
+
+        except Exception as e:
+            print(f"[ERROR] Exception occurred in separate_tensor: {e}")
+            print(traceback.format_exc())
+            raise e
 
     def separate_audio_file(self, file: Path):
         """
@@ -304,7 +334,14 @@ class Separator:
         are the name of stems and values are separated waves. The original wave will have already
         been resampled.
         """
-        return self.separate_tensor(self._load_audio(file), self.samplerate)
+        try:
+            print(f"[DEBUG] About to load audio from: {file}")
+            loaded_audio = self._load_audio(file)
+            print(f"[DEBUG] Loaded audio with shape: {loaded_audio.shape}")
+            return self.separate_tensor(loaded_audio, self.samplerate)
+        except Exception as e:
+            print(f"[ERROR] An error occurred: {e}")
+
 
     @property
     def samplerate(self):
